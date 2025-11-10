@@ -358,6 +358,56 @@ def upload_dataframe_as_parquet(context: OpExecutionContext, df: pd.DataFrame, k
     )
     return out_key
 
+@op(
+    ins={
+        "processed_csv_key": In(str, description="Clave del datos.csv en bronze. Usado para asegurar dependencia."),
+        "source_key": In(default_value=None, description="Clave S3 original (del tag del run)")
+    }
+)
+def move_original_file_to_archive(context: OpExecutionContext, processed_csv_key: str, source_key: str | None):
+    """
+    Mueve el archivo ZIP original (ej: de 'uploads/') a una carpeta 
+    organizada por fecha (ej: 'uploads/YYYY/MM/DD/')
+    después de que el procesamiento (build_datos_csv_from_unzip) haya terminado.
+    """
+    logger = get_dagster_logger()
+
+    # ... (código de 'key', 'processed_csv_key', 's3', 'lm_iso' sin cambios) ...
+    key = source_key or context.run.tags.get("s3_key")
+    if not key:
+        raise Failure("No se encontró 's3_key' en los tags del run para archivar.")
+
+    if not processed_csv_key:
+        logger.warning(f"No se generó CSV para {key}, no se archivará el original.")
+        return None
+
+    s3 = make_s3()
+
+    lm_iso = context.run.tags.get("s3_last_modified")
+    ts_utc = datetime.fromisoformat(lm_iso) if lm_iso else datetime.now(timezone.utc)
+    parts = _local_parts(ts_utc)
+    y, m, d = parts["y"], parts["m"], parts["d"]
+
+    base_filename = os.path.basename(key)
+    
+    # --- CAMBIO AQUÍ ---
+    # Se ha quitado el subdirectorio '/archive'
+    dest_key = f"{INGEST_PREFIX.rstrip('/')}/{y}/{m}/{d}/{base_filename}"
+
+    try:
+        # 1. Copiar el objeto
+        copy_source = {'Bucket': BUCKET, 'Key': key}
+        s3.copy_object(CopySource=copy_source, Bucket=BUCKET, Key=dest_key)
+        
+        # 2. Borrar el objeto original (solo si la copia fue exitosa)
+        s3.delete_object(Bucket=BUCKET, Key=key)
+        
+        logger.info(f"Archivado archivo original: s3://{BUCKET}/{key} -> s3://{BUCKET}/{dest_key}")
+        return dest_key
+    except Exception as e:
+        logger.error(f"Fallo al archivar {key}: {e}")
+        raise Failure(f"Fallo al archivar {key}: {e}")
+
 # ---------- Job ----------
 @job
 def ingest_job():
@@ -368,6 +418,9 @@ def ingest_job():
         uploaded_keys=unzip_results.uploaded_keys,
         job_prefix=unzip_results.job_prefix
     )
+    move_original_file_to_archive(
+        processed_csv_key=_out_csv
+    )
 
 # ---------- Sensor ----------
 @sensor(job=ingest_job, minimum_interval_seconds=3)
@@ -375,11 +428,20 @@ def s3_new_objects_sensor(context):
     last_seen = context.cursor
     now_iso   = datetime.now(timezone.utc).isoformat()
 
+    clean_ingest_prefix = INGEST_PREFIX.rstrip('/') + '/'
+    
     items = []
-    for obj in _list_objects(INGEST_PREFIX):
+    for obj in _list_objects(clean_ingest_prefix):
+        key = obj["Key"]
         lm_iso = obj["LastModified"].astimezone(timezone.utc).isoformat()
+       
+        relative_path = key[len(clean_ingest_prefix):]
+
+        if '/' in relative_path:
+            continue
+
         if last_seen is None or lm_iso > last_seen:
-            items.append((obj["Key"], lm_iso))
+            items.append((key, lm_iso))
 
     if not items:
         if last_seen is None:
@@ -396,6 +458,7 @@ def s3_new_objects_sensor(context):
                     "validate_file":   {"inputs": {"key": {"value": key}}},
                     "uncompress_zip":   {"inputs": {"key": {"value": key}}},
                     "build_datos_csv_from_unzip": {"inputs": {"key": {"value": key}}},
+                    "move_original_file_to_archive": {"inputs": {"source_key": {"value": key}}}
                 }
             },
             tags={"s3_key": key, "s3_last_modified": lm_iso},

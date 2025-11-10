@@ -1,6 +1,5 @@
 <?xml version="1.0"?>
 <configuration>
-  <!-- Usar credenciales de AWS por cadena estándar (env, profile, IAM role) -->
   <property>
     <name>fs.s3a.aws.credentials.provider</name>
     <value>com.amazonaws.auth.DefaultAWSCredentialsProviderChain</value>
@@ -21,11 +20,11 @@
     <value>${AWS_REGION}</value>
   </property>
 
-  <!-- Mantener las implementaciones S3A (bien tenerlas) -->
   <property>
     <name>fs.s3a.impl</name>
     <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
   </property>
+
   <property>
     <name>fs.AbstractFileSystem.s3a.impl</name>
     <value>org.apache.hadoop.fs.s3a.S3A</value>
