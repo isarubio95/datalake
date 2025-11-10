@@ -21,9 +21,9 @@ from zipfile import ZipFile, BadZipFile
 
 # ---------- Config ----------
 DBT_PROFILES_DIR = os.getenv("DBT_PROFILES_DIR", "/work/dbt")
-BUCKET        = os.getenv("S3_BUCKET")
+BUCKET          = os.getenv("S3_BUCKET")
 INGEST_PREFIX = os.getenv("INGEST_PREFIX")
-BRONZE_PREFIX = os.getenv("BRONZE_PREFIX")
+BRONZE_PREFIX = os.getenv("BRONZE_PREFIX")  # No se usa en este flujo, pero se mantiene por compatibilidad
 TZ_EUROPE_MAD = ZoneInfo("Europe/Madrid")
 _S3_CLIENT_CACHE: dict[str, boto3.client] = {}
 
@@ -130,8 +130,6 @@ def _read_tabular_from_bytes(name: str, data: bytes) -> pd.DataFrame:
                 if isinstance(obj, list):
                     df = pd.json_normalize(obj)
                 elif isinstance(obj, dict):
-                    # si es dict con una clave principal que contiene lista
-                    # intenta normalizar; si no, crea DF de una fila
                     for v in obj.values():
                         if isinstance(v, list):
                             df = pd.json_normalize(v)
@@ -141,14 +139,13 @@ def _read_tabular_from_bytes(name: str, data: bytes) -> pd.DataFrame:
                 else:
                     raise ValueError("JSON no tabular")
             except Exception:
-                # Caso 2: NDJSON (una entidad por línea)
+                # Caso 2: NDJSON
                 lines = [ln for ln in text.splitlines() if ln.strip()]
                 rows = []
                 for ln in lines:
                     try:
                         rows.append(json.loads(ln))
                     except Exception:
-                        # si alguna línea no es JSON, fallo total para no mezclar
                         raise Failure(f"JSON NDJSON no válido en {name}")
                 df = pd.json_normalize(rows)
         df["source_sheet"] = pd.NA
@@ -161,8 +158,11 @@ def _read_tabular_from_bytes(name: str, data: bytes) -> pd.DataFrame:
 
 
 # ---------- Ops ----------
-@op
-def download_from_s3(key: str) -> bytes:
+@op(ins={"key": In(default_value=None)})
+def download_from_s3(context: OpExecutionContext, key: str | None) -> bytes:
+    key = key or context.run.tags.get("s3_key")
+    if not key:
+        raise Failure("download_from_s3: falta 'key' (tag 's3_key' no presente).")
     s3 = make_s3()
     buf = BytesIO()
     s3.download_fileobj(Bucket=BUCKET, Key=key, Fileobj=buf)
@@ -170,32 +170,30 @@ def download_from_s3(key: str) -> bytes:
     get_dagster_logger().info(f"Downloaded {key} ({buf.getbuffer().nbytes} bytes)")
     return buf.getvalue()
 
-@op
-def validate_file(payload: bytes, key: str) -> str:
+@op(ins={"payload": In(), "key": In(default_value=None)})
+def validate_file(context: OpExecutionContext, payload: bytes, key: str | None) -> str:
+    key = key or context.run.tags.get("s3_key") or ""
     k = key.lower()
-    if k.endswith(".zip"):  return "zip"
+    if k.endswith(".zip"):
+        return "zip"
     raise Failure(f"The file {key} is not an Excel file (.xlsx/.xls/.csv/.zip)")
 
+# --- Ops fusionadas ---
 @op(
-    out={
-        "uploaded_keys": Out(List[str], description="Lista de S3 keys subidas"),
-        "job_prefix": Out(str, description="El prefijo S3 único para este job (ej: .../{job_uid})")
-    }
+    ins={"payload": In(), "key": In(default_value=None)},
+    out=Out(str, description="La S3 key del 'datos.csv' generado.")
 )
-def uncompress_zip(context: OpExecutionContext, payload: bytes, key: str): # <-- Quita el return type hint
+def process_zip_and_upload(context: OpExecutionContext, payload: bytes, key: str | None) -> str:
     """
-    Descomprime `payload` (ZIP) y sube todos los archivos a:
-      s3://<BUCKET>/data/<YYYY>/<MM>/<DD>/<job_uid>/<nombre_del_fichero>
-    Devuelve la lista de claves Y el prefijo del job.
+    Descomprime, procesa 'intrinsics.json' y 'results.json' en memoria,
+    genera 'datos.csv' y sube todo el contenido descomprimido + 'datos.csv' a S3.
     """
     logger = get_dagster_logger()
+    key = key or context.run.tags.get("s3_key") or ""
 
     if not key.lower().endswith(".zip"):
-        logger.info(f"uncompress_zip: {key} no es .zip, no se hace nada.")
-        # Devuelve valores vacíos para ambas salidas
-        yield Output([], "uploaded_keys")
-        yield Output("", "job_prefix") # O puedes fallar, pero esto es más seguro
-        return
+        logger.info(f"process_zip_and_upload: {key} no es .zip, no se hace nada.")
+        return ""
 
     try:
         zf = ZipFile(BytesIO(payload))
@@ -204,6 +202,11 @@ def uncompress_zip(context: OpExecutionContext, payload: bytes, key: str): # <--
 
     s3 = make_s3()
     created: list[str] = []
+    
+    # --- Datos que se extraerán del ZIP ---
+    intrinsics_data: bytes | None = None
+    results_data: bytes | None = None
+    files_to_upload: list[tuple[str, bytes, str]] = [] # (dest_key, data, content_type)
 
     # --- Prefijo fecha ---
     lm_iso = context.run.tags.get("s3_last_modified")
@@ -211,152 +214,87 @@ def uncompress_zip(context: OpExecutionContext, payload: bytes, key: str): # <--
     ts_local = ts_utc.astimezone(TZ_EUROPE_MAD)
 
     # Usa el código del folder del ZIP + UID(6)
-    zip_stem = os.path.splitext(os.path.basename(key))[0]  # p.ej., 'mi_paquete' de '.../mi_paquete.zip'
+    zip_stem = os.path.splitext(os.path.basename(key))[0]
     uid6 = uuid.uuid4().hex[:6]
     job_uid = f"{zip_stem}_{uid6}"
-
+    
     # El prefijo ahora incluye el nuevo subnivel único
     prefix = f"data/{ts_local.year}/{ts_local.month:02d}/{ts_local.day:02d}/{job_uid}"
-
-    # --- Recorremos los archivos del ZIP ---
+    
+    # --- 1. Recorremos los archivos del ZIP (Solo lectura) ---
     for zi in zf.infolist():
         name = zi.filename
         if name.endswith("/") or "__MACOSX" in name or os.path.basename(name).startswith("~$"):
             continue
+        
         with zf.open(zi, "r") as fp:
             data = fp.read()
+            if not data: # Ignorar archivos vacíos
+                continue
+        
         filename = os.path.basename(name)
         dest_key = f"{prefix}/{filename}"
+        
+        # Guardar datos para subida posterior
         ctype, _ = mimetypes.guess_type(filename)
-        if not ctype:
-            ctype = "application/octet-stream"
-        try:
-            s3.put_object(Bucket=BUCKET, Key=dest_key, Body=data, ContentType=ctype)
-            created.append(dest_key)
-            logger.info(f"Subido: s3://{BUCKET}/{dest_key}")
-        except Exception as e:
-            logger.warning(f"Error subiendo {filename}: {e}")
+        ctype = ctype or "application/octet-stream"
+        files_to_upload.append((dest_key, data, ctype))
 
-    if not created:
-        raise Failure("El ZIP no contenía archivos válidos para subir")
+        # Capturar intrinsics y results en memoria
+        base_lower = filename.lower()
+        if base_lower == "intrinsics.json":
+            intrinsics_data = data
+        elif base_lower == "results.json":
+            results_data = data
 
-    logger.info(f"Total subidos: {len(created)} archivos → prefijo s3://{BUCKET}/{prefix}/")
-    
-    yield Output(created, "uploaded_keys")
-    yield Output(prefix, "job_prefix")
+    if not files_to_upload:
+        raise Failure("El ZIP no contenía archivos válidos")
 
-@op
-def build_datos_csv_from_unzip(
-    context: OpExecutionContext, 
-    uploaded_keys: List[str], 
-    key: str, 
-    job_prefix: str  # <-- NUEVA ENTRADA
-) -> str:
-    """
-    Crea un CSV 'datos.csv' DENTRO de la carpeta única del job_prefix.
-    s3://<BUCKET>/data/<YYYY>/<MM>/<DD>/<job_uid>/datos.csv
-    """
-    logger = get_dagster_logger()
-    s3 = make_s3()
-
-    # Si no se subieron archivos (ej. ZIP vacío), no hacer nada
-    if not uploaded_keys or not job_prefix:
-        logger.info("No se subieron archivos, saltando creación de datos.csv")
-        return ""
-
-    # Fecha local (para el timestamp)
-    lm_iso = context.run.tags.get("s3_last_modified")
-    ts_utc = datetime.fromisoformat(lm_iso) if lm_iso else datetime.now(timezone.utc)
-    ts_local = ts_utc.astimezone(TZ_EUROPE_MAD)
-    
-    # record_id desde el nombre del ZIP
-    record_id = os.path.splitext(os.path.basename(key))[0]
-
-    # localiza las rutas subidas de intrinsics y results
-    intrinsics_key = None
-    results_key = None
-    for k in uploaded_keys:
-        base = os.path.basename(k).lower()
-        if base == "intrinsics.json":
-            intrinsics_key = k
-        elif base == "results.json":
-            results_key = k
-
-    if not intrinsics_key:
+    # --- 2. Procesar JSONs (que ya están en memoria) ---
+    if not intrinsics_data:
         raise Failure("No se encontró intrinsics.json dentro del ZIP")
-    if not results_key:
+    if not results_data:
         raise Failure("No se encontró results.json dentro del ZIP")
 
-    # descarga y parsea intrinsics.json
-    intr_obj = s3.get_object(Bucket=BUCKET, Key=intrinsics_key)
-    intr_json = json.loads(intr_obj["Body"].read().decode("utf-8"))
-    intr_raw = intr_json.get("raw")
-    if not isinstance(intr_raw, str):
-        raise Failure("intrinsics.json no contiene el campo 'raw' (string)")
+    try:
+        intr_json = json.loads(intrinsics_data.decode("utf-8"))
+        intr_raw = intr_json.get("raw")
+        if not isinstance(intr_raw, str):
+            raise Failure("intrinsics.json no contiene el campo 'raw' (string)")
+            
+        res_json = json.loads(results_data.decode("utf-8"))
+        thickness = res_json.get("thickness_mm")
+    except Exception as e:
+        raise Failure(f"Error al parsear JSONs desde el ZIP: {e}")
 
-    # descarga y parsea results.json
-    res_obj = s3.get_object(Bucket=BUCKET, Key=results_key)
-    res_json = json.loads(res_obj["Body"].read().decode("utf-8"))
-    thickness = res_json.get("thickness_mm")
-
-    # construye DataFrame con una fila
+    # --- 3. Construir datos.csv ---
+    record_id = os.path.splitext(os.path.basename(key))[0]
     df = pd.DataFrame([{
         "record_id": record_id,
         "timestamp": ts_local.isoformat(),
         "intrinsics": intr_raw,
         "thickness": thickness,
     }])
-
-    # serializa a CSV (sin índice)
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-
-    # Usa el job_prefix y le añade /datos.csv
-    out_key = f"{job_prefix.rstrip('/')}/datos.csv"
     
-    s3.put_object(
-        Bucket=BUCKET,
-        Key=out_key,
-        Body=csv_bytes,
-        ContentType="text/csv; charset=utf-8"
-    )
-    logger.info(f"Creado CSV: s3://{BUCKET}/{out_key}")
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    out_key = f"{prefix.rstrip('/')}/datos.csv"
+    
+    # Añadir el CSV a la lista de subida
+    files_to_upload.append((out_key, csv_bytes, "text/csv; charset=utf-8"))
+    
+    # --- 4. Subir todos los archivos a S3 ---
+    for dest_key, data, ctype in files_to_upload:
+        try:
+            s3.put_object(Bucket=BUCKET, Key=dest_key, Body=data, ContentType=ctype)
+            created.append(dest_key)
+        except Exception as e:
+            logger.warning(f"Error subiendo {dest_key}: {e}")
+
+    logger.info(f"Total subidos: {len(created)} archivos → prefijo s3://{BUCKET}/{prefix}/")
+    
+    # Devolver la clave del CSV, que es la dependencia para el siguiente paso
     return out_key
 
-
-@op(ins={"key": In(default_value=None, description="Source S3 key (optional, taken from tags if not provided)")})
-def upload_dataframe_as_parquet(context: OpExecutionContext, df: pd.DataFrame, key: str | None) -> str:
-    key = key or context.run.tags.get("s3_key")
-    lm_iso = context.run.tags.get("s3_last_modified")
-    ts_utc = datetime.fromisoformat(lm_iso) if lm_iso else datetime.now(timezone.utc)
-    parts = _local_parts(ts_utc)
-
-    df = df.copy()
-    df["year"], df["month"], df["day"] = (
-        parts["y"], int(parts["m"]), int(parts["d"])
-    )
-
-    base = os.path.basename(key)
-    stem = os.path.splitext(base)[0]
-    uid = f"{int(datetime.now(timezone.utc).timestamp())%100000:05d}"
-    out_key = (
-        f"{SILVER_PREFIX.rstrip('/')}/"
-        f"year={parts['y']}/month={parts['m']}/day={parts['d']}/"
-        f"{stem}_{uid}.parquet"
-    )
-
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    table = pa.Table.from_pandas(df)
-    buf = BytesIO()
-    pq.write_table(table, buf, compression="snappy")
-    buf.seek(0)
-
-    s3 = make_s3()
-    s3.put_object(Bucket=BUCKET, Key=out_key, Body=buf.getvalue())
-    get_dagster_logger().info(
-        f"Uploaded: s3://{BUCKET}/{out_key} (partition {parts['y']}-{parts['m']}-{parts['d']} Europe/Madrid)"
-    )
-    return out_key
 
 @op(
     ins={
@@ -364,63 +302,49 @@ def upload_dataframe_as_parquet(context: OpExecutionContext, df: pd.DataFrame, k
         "source_key": In(default_value=None, description="Clave S3 original (del tag del run)")
     }
 )
-def move_original_file_to_archive(context: OpExecutionContext, processed_csv_key: str, source_key: str | None):
+def move_original_file_to_archive(  # mantiene el nombre por compatibilidad
+    context: OpExecutionContext,
+    processed_csv_key: str,
+    source_key: str | None
+):
     """
-    Mueve el archivo ZIP original (ej: de 'uploads/') a una carpeta 
-    organizada por fecha (ej: 'uploads/YYYY/MM/DD/')
-    después de que el procesamiento (build_datos_csv_from_unzip) haya terminado.
+    Tras crear datos.csv, elimina el ZIP original.
+    No copia ni mueve a ninguna carpeta de 'uploads/'. No deja rastro.
     """
     logger = get_dagster_logger()
 
-    # ... (código de 'key', 'processed_csv_key', 's3', 'lm_iso' sin cambios) ...
     key = source_key or context.run.tags.get("s3_key")
     if not key:
-        raise Failure("No se encontró 's3_key' en los tags del run para archivar.")
+        raise Failure("No se encontró 's3_key' en los tags del run para borrar el ZIP original.")
 
     if not processed_csv_key:
-        logger.warning(f"No se generó CSV para {key}, no se archivará el original.")
+        # Si por algún motivo no se generó el CSV, no borres el original.
+        logger.warning(f"No se generó CSV para {key}; se mantiene el ZIP original.")
         return None
 
     s3 = make_s3()
-
-    lm_iso = context.run.tags.get("s3_last_modified")
-    ts_utc = datetime.fromisoformat(lm_iso) if lm_iso else datetime.now(timezone.utc)
-    parts = _local_parts(ts_utc)
-    y, m, d = parts["y"], parts["m"], parts["d"]
-
-    base_filename = os.path.basename(key)
-    
-    # --- CAMBIO AQUÍ ---
-    # Se ha quitado el subdirectorio '/archive'
-    dest_key = f"{INGEST_PREFIX.rstrip('/')}/{y}/{m}/{d}/{base_filename}"
-
     try:
-        # 1. Copiar el objeto
-        copy_source = {'Bucket': BUCKET, 'Key': key}
-        s3.copy_object(CopySource=copy_source, Bucket=BUCKET, Key=dest_key)
-        
-        # 2. Borrar el objeto original (solo si la copia fue exitosa)
         s3.delete_object(Bucket=BUCKET, Key=key)
-        
-        logger.info(f"Archivado archivo original: s3://{BUCKET}/{key} -> s3://{BUCKET}/{dest_key}")
-        return dest_key
+        logger.info(f"Eliminado ZIP original: s3://{BUCKET}/{key}")
+        return None
     except Exception as e:
-        logger.error(f"Fallo al archivar {key}: {e}")
-        raise Failure(f"Fallo al archivar {key}: {e}")
+        logger.error(f"Fallo al eliminar {key}: {e}")
+        raise Failure(f"Fallo al eliminar {key}: {e}")
+
 
 # ---------- Job ----------
 @job
 def ingest_job():
-    payload = download_from_s3()                     
-    _ext    = validate_file(payload)                 
-    unzip_results = uncompress_zip(payload)
-    _out_csv = build_datos_csv_from_unzip(
-        uploaded_keys=unzip_results.uploaded_keys,
-        job_prefix=unzip_results.job_prefix
-    )
+    payload = download_from_s3()                # key llega por tags
+    _ext    = validate_file(payload)            # key llega por tags
+    
+    # Esta 'op' ahora hace todo: descomprime, procesa JSONs, crea CSV y sube todo
+    _out_csv = process_zip_and_upload(payload)  # key llega por tags
+    
     move_original_file_to_archive(
-        processed_csv_key=_out_csv
+        processed_csv_key=_out_csv              # source_key llega por tags
     )
+
 
 # ---------- Sensor ----------
 @sensor(job=ingest_job, minimum_interval_seconds=3)
@@ -429,17 +353,18 @@ def s3_new_objects_sensor(context):
     now_iso   = datetime.now(timezone.utc).isoformat()
 
     clean_ingest_prefix = INGEST_PREFIX.rstrip('/') + '/'
-    
+
     items = []
     for obj in _list_objects(clean_ingest_prefix):
         key = obj["Key"]
-        lm_iso = obj["LastModified"].astimezone(timezone.utc).isoformat()
-       
+        # Solo ZIPs en la raíz del prefix
+        if not key.lower().endswith(".zip"):
+            continue
         relative_path = key[len(clean_ingest_prefix):]
-
         if '/' in relative_path:
             continue
 
+        lm_iso = obj["LastModified"].astimezone(timezone.utc).isoformat()
         if last_seen is None or lm_iso > last_seen:
             items.append((key, lm_iso))
 
@@ -450,17 +375,9 @@ def s3_new_objects_sensor(context):
 
     items.sort(key=lambda x: x[1])
     for key, lm_iso in items:
+        # No hay run_config → no se exige "ops" en la raíz
         yield RunRequest(
-            run_key = f"{lm_iso}|{key}",
-            run_config={
-                "ops": {
-                    "download_from_s3": {"inputs": {"key": {"value": key}}},
-                    "validate_file":   {"inputs": {"key": {"value": key}}},
-                    "uncompress_zip":   {"inputs": {"key": {"value": key}}},
-                    "build_datos_csv_from_unzip": {"inputs": {"key": {"value": key}}},
-                    "move_original_file_to_archive": {"inputs": {"source_key": {"value": key}}}
-                }
-            },
+            run_key=f"{lm_iso}|{key}",
             tags={"s3_key": key, "s3_last_modified": lm_iso},
         )
 
