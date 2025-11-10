@@ -1,0 +1,30 @@
+# NumPy / Pandas (Py3.10)
+numpy==1.26.4
+pandas==2.2.2
+
+# IO Excel / Parquet
+openpyxl
+pyarrow
+
+# Dagster 1.9.x (compatibles con protobuf 5.x)
+dagster==1.9.10
+dagster-webserver==1.9.10
+dagster-dbt==0.25.10
+dagster-mysql==0.25.10
+
+# dbt 1.9.x
+dbt-core==1.9.2
+dbt-trino==1.9.3
+dbt-spark==1.9.3
+
+# Utilidades
+pyspark==3.3.2
+prettytable==3.3.0
+requests==2.31.0
+yfinance==0.2.54
+kaggle==1.6.17
+markupsafe==2.1.5
+boto3==1.34.100
+
+# Forzar protobuf 5.x (satisface dbt y dagster 1.9.x)
+protobuf==5.29.5

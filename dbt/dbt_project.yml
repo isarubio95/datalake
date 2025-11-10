@@ -1,0 +1,9 @@
+﻿name: ngods
+version: 1.0.0
+config-version: 2
+
+profile: ngods
+model-paths: ["models"]
+
+models:
+  +materialized: view

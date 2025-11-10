@@ -1,0 +1,31 @@
+# Ignorar archivos temporales de VSCode
+.vscode/
+
+# Ignorar archivos de resultados de ejecución y manifiestos semánticos generados por dbt
+dagster_home/.*
+dagster_home/storage/
+dagster_home/schedules/
+dagster_home/history/
+dagster_home/logs/
+
+# Ignorar archivos compilados de Python
+dagster_jobs/_pycache_/
+
+# Ignorar archivos de resultados de ejecución y manifiestos semánticos generados por dbt
+dbt/target/
+
+# Ignorar archivos compilados de Python
+__pycache__
+
+# Ignorar archivos de la base de datos de Metastore de Apache Hive
+metastore_db/db*
+metastore_db/seg*/
+metastore_db/tmp*
+metastore_db/README*
+metastore_db/log/
+
+# Ignorar archivos de logs de Apache Derby
+derby.log
+
+# Ignorar archivos de configuración de entorno
+.env

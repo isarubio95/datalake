@@ -1,0 +1,22 @@
+ngods:
+  target: trino
+  outputs:
+    trino:
+      type: trino
+      method: none
+      host: trino
+      port: 8080
+      user: dbt
+      catalog: iceberg
+      schema: default
+      threads: 4
+    spark:
+      type: spark
+      method: thrift
+      host: spark-thrift
+      port: 10000
+      user: dbt
+      schema: default
+      connect_timeout: 60
+      retries: 3
+      # Opcional: si usas S3/MinIO en Spark, lo resolvemos vía conf montada

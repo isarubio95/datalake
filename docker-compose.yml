@@ -1,0 +1,214 @@
+services:
+  mariadb:
+    image: mariadb:10.11
+    container_name: ${COMPOSE_PROJECT_NAME}-mariadb
+    environment:
+      - MARIADB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+    ports:
+      - "3307:3306"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+      - ./init/mariadb:/docker-entrypoint-initdb.d:ro
+    networks:
+      - default
+
+  metastore:
+    image: sslhep/hive-metastore:3.1.3
+    container_name: ${COMPOSE_PROJECT_NAME}-metastore
+    depends_on:
+      mariadb:
+        condition: service_started
+    environment:
+      HIVE_CONF_DIR: /opt/hive/conf
+      HIVE_AUX_JARS_PATH: /opt/hive/auxlib
+      HIVE_METASTORE_AUX_JARS_PATH: /opt/hive/auxlib
+      CLASSPATH: /opt/hive/auxlib/*:/opt/hadoop/share/hadoop/common/lib/*
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      AWS_EC2_METADATA_DISABLED: "true"
+    entrypoint: ["/bin/bash","-lc",
+      "set -euo pipefail;
+       echo 'Usando HIVE_CONF_DIR='${HIVE_CONF_DIR:-};
+       ls -l /opt/hive/conf/ || true;
+       echo 'Contenido auxlib:'; ls -l /opt/hive/auxlib/ || true;
+       echo 'Inicializando/actualizando esquema en MySQL...';
+       /opt/hive/bin/schematool -dbType mysql -initSchema --verbose \
+         || /opt/hive/bin/schematool -dbType mysql -upgradeSchema --verbose;
+       echo 'Lanzando Hive Metastore en :9083...';
+       exec /opt/hive/bin/hive --service metastore -p 9083"
+    ]
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./conf/spark/core-site.xml:/opt/hive/conf/core-site.xml:ro
+      - ./conf/spark/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+      - ./conf/metastore/auxlib:/opt/hive/auxlib:ro
+    networks:
+      - default
+
+  spark-thrift:
+    image: trivadis/apache-spark-thriftserver:3.3.2-hadoop3.3
+    container_name: ${COMPOSE_PROJECT_NAME}-spark-thrift
+    depends_on:
+      metastore:
+        condition: service_started
+    environment:
+      HADOOP_CONF_DIR: /opt/spark/conf
+      SPARK_PRINT_LAUNCH_COMMAND: "1"
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      AWS_EC2_METADATA_DISABLED: "true"
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        echo 'Resolviendo ruta de spark-submit...'
+        CANDS=("$${SPARK_HOME:-}/bin/spark-submit" "/opt/spark/bin/spark-submit" "/usr/local/spark/bin/spark-submit" "/spark/bin/spark-submit")
+        SPARK_SUBMIT=''
+        for c in "$${CANDS[@]}"; do
+          if [ -x "$$c" ]; then SPARK_SUBMIT="$$c"; break; fi
+        done
+        if [ -z "$$SPARK_SUBMIT" ]; then
+          echo 'ERROR: no se encontró spark-submit'; printf '%s\n' "$${CANDS[@]}"; exit 1
+        fi
+
+        # Autodetectar JAVA_HOME si no viene
+        if [ -z "$${JAVA_HOME:-}" ] && command -v java >/dev/null 2>&1; then
+          JB="$$(command -v java)"; export JAVA_HOME="$$(dirname "$$(dirname "$$(readlink -f "$$JB")")")"
+        fi
+        echo "JAVA_HOME=$${JAVA_HOME:-<no-definido>}"
+        java -version || true
+
+        # Asegurar directorios de logs/eventos
+        mkdir -p /tmp/spark-events || true
+        mkdir -p /var/log/spark/logs || true
+
+        echo "Usando spark-submit: $$SPARK_SUBMIT"
+        echo 'Lanzando Spark ThriftServer via spark-submit...'
+        exec "$$SPARK_SUBMIT" \
+          --packages org.apache.iceberg:iceberg-spark-runtime-3.3_2.12:1.4.3,org.apache.hadoop:hadoop-aws:3.3.2,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
+          --class org.apache.spark.sql.hive.thriftserver.HiveThriftServer2 \
+          --master local[*] \
+          --deploy-mode client \         
+          --conf spark.hadoop.hive.metastore.uris=thrift://metastore:9083 \
+          --conf spark.sql.catalogImplementation=hive \
+          --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+          --conf spark.hadoop.fs.s3a.region=${AWS_REGION} \
+          --conf spark.hadoop.fs.s3a.aws.credentials.provider=com.amazonaws.auth.DefaultAWSCredentialsProviderChain \
+          --conf spark.hadoop.fs.s3a.connection.ssl.enabled=true \          
+          --conf spark.eventLog.enabled=true \
+          --conf spark.eventLog.dir=/tmp/spark-events
+    ports:
+      - "10000:10000"
+      - "4040:4040"    
+    volumes:
+      - ./conf/spark/core-site.xml:/opt/spark/conf/core-site.xml:ro
+      - ./conf/spark/hive-site.xml:/opt/spark/conf/hive-site.xml:ro
+      - ./conf/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    networks:
+      - default
+
+  trino:
+    image: trinodb/trino:${TRINO_VERSION}
+    container_name: ${COMPOSE_PROJECT_NAME}-trino
+    depends_on:
+      metastore:
+        condition: service_started
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./conf/trino/catalog:/etc/trino/catalog:ro
+      - ./conf/trino/core-site.xml:/etc/trino/core-site.xml:ro
+    env_file:
+      - .env
+    networks:
+      - default
+
+  dbt-runner:
+    build:
+      context: .                          
+      dockerfile: ./docker/dbt-runner/Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE}
+    container_name: ${COMPOSE_PROJECT_NAME}-dbt
+    depends_on:
+      trino:
+        condition: service_started
+      spark-thrift:
+        condition: service_started
+    volumes:
+      - ./dbt/profiles.yml:/root/.dbt/profiles.yml:ro
+      - ./requirements.txt:/opt/requirements.txt:ro
+      - ./:/work
+    working_dir: /work
+    entrypoint: ["sleep", "infinity"]
+    networks:
+      - default
+  
+  dagster-webserver:
+    build:
+      context: .
+      dockerfile: ./docker/dagster/Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME}-dagster-webserver
+    command: ["dagster-webserver", "-m", "dagster_jobs", "-h", "0.0.0.0", "-p", "3000"]
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./:/work
+      - ./dagster_home:/dagster_home       
+    environment:
+      - DAGSTER_HOME=/dagster_home
+      - DBT_PROFILES_DIR=/work/dbt
+      - DAGSTER_MYSQL_USERNAME=${DB_USER}
+      - DAGSTER_MYSQL_PASSWORD=${DB_PASSWORD}
+      - DAGSTER_MYSQL_DB=${DB_NAME}
+      - DAGSTER_MYSQL_HOST=${DB_HOST}
+      - DAGSTER_MYSQL_PORT=${DB_PORT}
+      - S3_PREFIX=ingest/
+      - S3_BUCKET=${S3_BUCKET}
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    depends_on:
+      mariadb:
+        condition: service_started
+    networks:
+      - default
+
+  dagster-daemon:
+    build:
+      context: .
+      dockerfile: ./docker/dagster/Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME}-dagster-daemon
+    command: ["dagster-daemon", "run", "-m", "dagster_jobs"]
+    volumes:
+      - ./:/work
+      - ./dagster_home:/dagster_home      
+    environment:
+      - DAGSTER_HOME=/dagster_home
+      - DBT_PROFILES_DIR=/work/dbt
+      - DAGSTER_MYSQL_USERNAME=${DB_USER}
+      - DAGSTER_MYSQL_PASSWORD=${DB_PASSWORD}
+      - DAGSTER_MYSQL_DB=${DB_NAME}
+      - DAGSTER_MYSQL_HOST=${DB_HOST}
+      - DAGSTER_MYSQL_PORT=${DB_PORT}
+      - S3_PREFIX=ingest/
+      - S3_BUCKET=${S3_BUCKET}
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    depends_on:
+      mariadb:
+        condition: service_started
+    networks:
+      - default
+
+networks:
+  default:
+    name: ${NETWORK_NAME}
+
+volumes:
+  mariadb-data:
