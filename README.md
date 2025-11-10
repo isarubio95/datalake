@@ -1,4 +1,4 @@
-# 🌌 NGODS 2025 Lakehouse Stack
+# 🌌 2025 Lakehouse Stack
 
 Plataforma local de **data lakehouse** lista para ingeniería de datos moderna. Este stack combina almacenamiento S3 compatible, catálogo Iceberg/Hive, ejecución de Spark, SQL interactivo con Trino, orquestación con Dagster y transformaciones con dbt; todo empaquetado en contenedores y pensado para emular un entorno productivo.
 
@@ -32,7 +32,6 @@ Plataforma local de **data lakehouse** lista para ingeniería de datos moderna. 
 
 - Docker Engine ≥ 24  
 - Docker Compose ≥ 2.20  
-- Red Docker previa `ngodsnet` (externa, se crea una única vez)
 
 ---
 
@@ -40,11 +39,8 @@ Plataforma local de **data lakehouse** lista para ingeniería de datos moderna. 
 
 ```bash
 # Clonar el repositorio
-git clone https://github.com/tu_usuario/NGODS-2025.git
-cd NGODS-2025
-
-# Crear la red externa usada por todo el stack (solo la primera vez)
-docker network create ngodsnet
+git clone https://github.com/tu_usuario/datalake.git
+cd datalake
 
 # Inicializar buckets, catálogos y servicios base
 docker compose up -d mariadb metastore minio minio-setup

@@ -112,9 +112,10 @@ def list_day_csvs(context: OpExecutionContext, ymd: Tuple[int,int,int]) -> List[
 def download_and_concat(csv_keys: List[str]) -> pd.DataFrame:
     s3 = make_s3()
     frames: List[pd.DataFrame] = []
+    col_types = {"record_id": str}
     for k in csv_keys:
         obj = s3.get_object(Bucket=BUCKET, Key=k)
-        df = pd.read_csv(obj["Body"])
+        df = pd.read_csv(obj["Body"], dtype=col_types)
         # Normalizar columnas esperadas
         for col in ("record_id", "timestamp", "intrinsics", "thickness"):
             if col not in df.columns:
