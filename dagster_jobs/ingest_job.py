@@ -34,7 +34,6 @@ dbt = DbtCliResource(project_dir="/work/dbt", profiles_dir=DBT_PROFILES_DIR)
 def _bucket_region(bucket: str) -> str:
     """
     Descubre la región real del bucket usando un cliente neutro.
-    En us-east-1, LocationConstraint suele venir como None.
     """
     probe = boto3.client("s3")
     resp = probe.get_bucket_location(Bucket=bucket)
@@ -43,7 +42,6 @@ def _bucket_region(bucket: str) -> str:
 def make_s3():
     """
     Crea un cliente S3 de AWS en la región real del bucket.
-    NO usa S3_ENDPOINT. Usa credenciales AWS_*.
     """
     if BUCKET in _S3_CLIENT_CACHE:
         return _S3_CLIENT_CACHE[BUCKET]
@@ -176,9 +174,8 @@ def validate_file(context: OpExecutionContext, payload: bytes, key: str | None) 
     k = key.lower()
     if k.endswith(".zip"):
         return "zip"
-    raise Failure(f"The file {key} is not an Excel file (.xlsx/.xls/.csv/.zip)")
+    raise Failure(f"The file {key} is not an zip file (.zip)")
 
-# -------------------- Ops fusionadas --------------------
 @op(
     ins={"payload": In(), "key": In(default_value=None)},
     out=Out(str, description="La S3 key del 'datos.csv' generado.")
@@ -203,12 +200,12 @@ def process_zip_and_upload(context: OpExecutionContext, payload: bytes, key: str
     s3 = make_s3()
     created: list[str] = []
     
-    # --- Datos que se extraerán del ZIP ---
+    # Datos que se extraerán del ZIP
     intrinsics_data: bytes | None = None
     results_data: bytes | None = None
     files_to_upload: list[tuple[str, bytes, str]] = [] # (dest_key, data, content_type)
 
-    # --- Prefijo fecha ---
+    # Prefijo fecha 
     lm_iso = context.run.tags.get("s3_last_modified")
     ts_utc = datetime.fromisoformat(lm_iso) if lm_iso else datetime.now(timezone.utc)
     ts_local = ts_utc.astimezone(TZ_EUROPE_MAD)
@@ -218,7 +215,7 @@ def process_zip_and_upload(context: OpExecutionContext, payload: bytes, key: str
     uid6 = uuid.uuid4().hex[:6]
     job_uid = f"{zip_stem}_{uid6}"
     
-    # El prefijo ahora incluye el nuevo subnivel único
+    # Prefijo en nuevo subnivel único
     prefix = f"data/{ts_local.year}/{ts_local.month:02d}/{ts_local.day:02d}/{job_uid}"
     
     # --- 1. Recorremos los archivos del ZIP (Solo lectura) ---
