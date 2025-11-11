@@ -9,6 +9,11 @@ services:
     volumes:
       - mariadb-data:/var/lib/mysql
       - ./init/mariadb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - default
 
@@ -17,7 +22,7 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME}-metastore
     depends_on:
       mariadb:
-        condition: service_started
+        condition: service_healthy
     environment:
       HIVE_CONF_DIR: /opt/hive/conf
       HIVE_AUX_JARS_PATH: /opt/hive/auxlib
@@ -174,7 +179,7 @@ services:
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
     depends_on:
       mariadb:
-        condition: service_started
+        condition: service_healthy
     networks:
       - default
 
@@ -202,7 +207,7 @@ services:
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
     depends_on:
       mariadb:
-        condition: service_started
+        condition: service_healthy
     networks:
       - default
 

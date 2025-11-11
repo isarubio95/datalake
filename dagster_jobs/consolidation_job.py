@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from typing import Iterable, List, Tuple
 import boto3
@@ -22,12 +22,10 @@ S3_SSL_ENABLED    = os.getenv("S3_SSL_ENABLED", "true")
 BRONZE_PREFIX = os.getenv("BRONZE_PREFIX", "data")
 SILVER_PREFIX = os.getenv("SILVER_PREFIX", "silver")
 
-# ------------------------------------------------------------------
-#  Configuración / Utilidades S3
-# ------------------------------------------------------------------
+#  -------------------- Configuración --------------------
 try:
     # Reusar utilidades si existen en ingest_job
-    from .ingest_job import TZ_EUROPE_MAD, make_s3  # type: ignore
+    from .ingest_job import TZ_EUROPE_MAD, make_s3 
 except Exception:
     from zoneinfo import ZoneInfo
     TZ_EUROPE_MAD = ZoneInfo("Europe/Madrid")
@@ -82,14 +80,13 @@ def _silver_day_prefix(y: int, m: int, d: int) -> str:
     # Particionado tipo Hive
     return f"{SILVER_PREFIX.rstrip('/')}/year={y:04d}/month={m:02d}/day={d:02d}/"
 
-# ------------------------------------------------------------------
-#  Ops
-# ------------------------------------------------------------------
+#  -------------------- Ops --------------------
 @op(out=Out(Tuple[int,int,int], description="(year, month, day)"))
 def resolve_target_day(context: OpExecutionContext) -> Tuple[int,int,int]:
     """Día de consolidación -> hoy (Europe/Madrid). No necesita run_config."""
     now_local = datetime.now(timezone.utc).astimezone(TZ_EUROPE_MAD)
-    y, m, d = now_local.year, now_local.month, now_local.day
+    yesterday_local = now_local - timedelta(days=1)
+    y, m, d = yesterday_local.year, yesterday_local.month, yesterday_local.day
     get_dagster_logger().info(f"Consolidando para el día: {y:04d}-{m:02d}-{d:02d}")
     return (y, m, d)
 
@@ -213,7 +210,6 @@ def register_consolidated_in_iceberg(context: OpExecutionContext, parquet_key: s
         .config("spark.hadoop.fs.s3a.path.style.access", S3_PATH_STYLE)
     )
 
-    # Región (útil cuando no hay endpoint explícito)
     if os.getenv("AWS_REGION"):
         spark = spark.config("spark.hadoop.fs.s3a.region", os.getenv("AWS_REGION"))
 
@@ -231,7 +227,6 @@ def register_consolidated_in_iceberg(context: OpExecutionContext, parquet_key: s
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {ICEBERG_CATALOG}.{ICEBERG_DB}")
 
         # Crea tabla vacía si no existe, con la partición correcta
-        # (usamos un CTAS vacío para fijar particionado y esquema de df2)
         spark.sql(
             f"""CREATE TABLE IF NOT EXISTS {full_table}
                 USING iceberg
@@ -254,9 +249,7 @@ def register_consolidated_in_iceberg(context: OpExecutionContext, parquet_key: s
     finally:
         spark.stop()
 
-# ------------------------------------------------------------------
-#  Job
-# ------------------------------------------------------------------
+# -------------------- Job --------------------
 @job
 def consolidation_job():
     ymd = resolve_target_day()
@@ -266,9 +259,7 @@ def consolidation_job():
     pq   = upload_consolidated_parquet(df, ymd)
     _tbl = register_consolidated_in_iceberg(parquet_key=pq, ymd=ymd)
 
-# ------------------------------------------------------------------
 #  Schedule diario a las 23:59 (Europe/Madrid)
-# ------------------------------------------------------------------
 daily_consolidation_schedule = ScheduleDefinition(
     name="daily_consolidation_schedule",
     cron_schedule="59 23 * * *",

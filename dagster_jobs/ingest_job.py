@@ -19,18 +19,18 @@ from pyspark.sql import SparkSession
 from zipfile import ZipFile, BadZipFile
 
 
-# ---------- Config ----------
+# -------------------- Config --------------------
 DBT_PROFILES_DIR = os.getenv("DBT_PROFILES_DIR", "/work/dbt")
 BUCKET          = os.getenv("S3_BUCKET")
 INGEST_PREFIX = os.getenv("INGEST_PREFIX")
-BRONZE_PREFIX = os.getenv("BRONZE_PREFIX")  # No se usa en este flujo, pero se mantiene por compatibilidad
+BRONZE_PREFIX = os.getenv("BRONZE_PREFIX")
 TZ_EUROPE_MAD = ZoneInfo("Europe/Madrid")
 _S3_CLIENT_CACHE: dict[str, boto3.client] = {}
 
 dbt = DbtCliResource(project_dir="/work/dbt", profiles_dir=DBT_PROFILES_DIR)
 
 
-# ---------- Helpers ----------
+# -------------------- Helpers --------------------
 def _bucket_region(bucket: str) -> str:
     """
     Descubre la región real del bucket usando un cliente neutro.
@@ -157,7 +157,7 @@ def _read_tabular_from_bytes(name: str, data: bytes) -> pd.DataFrame:
     return df
 
 
-# ---------- Ops ----------
+# -------------------- Ops --------------------
 @op(ins={"key": In(default_value=None)})
 def download_from_s3(context: OpExecutionContext, key: str | None) -> bytes:
     key = key or context.run.tags.get("s3_key")
@@ -178,7 +178,7 @@ def validate_file(context: OpExecutionContext, payload: bytes, key: str | None) 
         return "zip"
     raise Failure(f"The file {key} is not an Excel file (.xlsx/.xls/.csv/.zip)")
 
-# --- Ops fusionadas ---
+# -------------------- Ops fusionadas --------------------
 @op(
     ins={"payload": In(), "key": In(default_value=None)},
     out=Out(str, description="La S3 key del 'datos.csv' generado.")
@@ -347,38 +347,57 @@ def ingest_job():
 
 
 # ---------- Sensor ----------
-@sensor(job=ingest_job, minimum_interval_seconds=3)
-def s3_new_objects_sensor(context):
-    last_seen = context.cursor
-    now_iso   = datetime.now(timezone.utc).isoformat()
+@sensor(
+    job=ingest_job,
+    minimum_interval_seconds=60 
+)
+def s3_process_existing_files_sensor(context):
+    """
+    Sensor "sin estado" (stateless) que procesa CUALQUIER .zip que encuentre.
+    Añadimos logs para depurar y un LÍMITE por tick.
+    """
+    # LÍMITE: Solo procesa 500 archivos por tick para evitar sobrecargar la DB
+    RUN_REQUEST_LIMIT_PER_TICK = 500 
+    
+    logger = get_dagster_logger() 
+    clean_ingest_prefix = (INGEST_PREFIX or "").rstrip('/') + '/'
 
-    clean_ingest_prefix = INGEST_PREFIX.rstrip('/') + '/'
-
-    items = []
-    for obj in _list_objects(clean_ingest_prefix):
-        key = obj["Key"]
-        # Solo ZIPs en la raíz del prefix
-        if not key.lower().endswith(".zip"):
-            continue
-        relative_path = key[len(clean_ingest_prefix):]
-        if '/' in relative_path:
-            continue
-
-        lm_iso = obj["LastModified"].astimezone(timezone.utc).isoformat()
-        if last_seen is None or lm_iso > last_seen:
-            items.append((key, lm_iso))
-
-    if not items:
-        if last_seen is None:
-            context.update_cursor(now_iso)
+    if not BUCKET or not INGEST_PREFIX:
+        logger.error(f"[Sensor] S3_BUCKET o INGEST_PREFIX no están configurados. El sensor no puede funcionar.")
         return
 
-    items.sort(key=lambda x: x[1])
-    for key, lm_iso in items:
-        # No hay run_config → no se exige "ops" en la raíz
-        yield RunRequest(
-            run_key=f"{lm_iso}|{key}",
-            tags={"s3_key": key, "s3_last_modified": lm_iso},
-        )
+    logger.info(f"[Sensor] Verificando S3 en: s3://{BUCKET}/{clean_ingest_prefix}")
 
-    context.update_cursor(items[-1][1])
+    try:
+        run_requests_generated = 0
+        
+        for obj in _list_objects(clean_ingest_prefix):
+            # Si ya hemos alcanzado el límite, paramos
+            if run_requests_generated >= RUN_REQUEST_LIMIT_PER_TICK:
+                logger.info(f"[Sensor] Límite de {RUN_REQUEST_LIMIT_PER_TICK} RunRequests alcanzado. Se procesarán más en el siguiente tick.")
+                break # <-- Salir del bucle for
+
+            key = obj["Key"]
+            logger.debug(f"[Sensor] Encontrado: {key}")
+
+            # 1. Filtro de .zip
+            if not key.lower().endswith(".zip"):
+                continue
+                
+            # 2. Filtro de raíz
+            relative_path = key[len(clean_ingest_prefix):]
+            if '/' in relative_path:
+                continue
+
+            lm_iso = obj["LastModified"].astimezone(timezone.utc).isoformat()
+            
+            logger.info(f"[Sensor] ✅ Lanzando job para: {key}")
+            
+            yield RunRequest(
+                run_key=f"ingest_{key}",
+                tags={"s3_key": key, "s3_last_modified": lm_iso},
+            )
+            run_requests_generated += 1
+
+    except Exception as e:
+        logger.error(f"[Sensor] Error al listar objetos S3: {e}", exc_info=True)

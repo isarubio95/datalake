@@ -1,0 +1,2 @@
+mariadb:
+ALTER TABLE job_ticks MODIFY COLUMN tick_body MEDIUMTEXT;
