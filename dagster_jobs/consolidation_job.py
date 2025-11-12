@@ -21,11 +21,12 @@ S3_PATH_STYLE     = os.getenv("S3_PATH_STYLE", "true")
 S3_SSL_ENABLED    = os.getenv("S3_SSL_ENABLED", "true")
 BRONZE_PREFIX = os.getenv("BRONZE_PREFIX", "data")
 SILVER_PREFIX = os.getenv("SILVER_PREFIX", "silver")
+CONSOLIDATE_DAY_OFFSET = 0 # días atrás desde hoy para consolidar
 
 #  -------------------- Configuración --------------------
 try:
     # Reusar utilidades si existen en ingest_job
-    from .ingest_job import TZ_EUROPE_MAD, make_s3 
+    from .ingest_job import TZ_EUROPE_MAD, make_s3
 except Exception:
     from zoneinfo import ZoneInfo
     TZ_EUROPE_MAD = ZoneInfo("Europe/Madrid")
@@ -73,7 +74,7 @@ def _list_objects(prefix: str) -> Iterable[dict]:
         token = resp.get("NextContinuationToken")
 
 def bronze_day_prefix(y: int, m: int, d: int) -> str:
-    # prefijo bronze por día (donde están los datos.csv diarios)
+    # prefijo bronze por día (donde están los data.csv diarios)
     return f"{BRONZE_PREFIX.rstrip('/')}/{y:04d}/{m:02d}/{d:02d}/"
 
 def _silver_day_prefix(y: int, m: int, d: int) -> str:
@@ -83,25 +84,26 @@ def _silver_day_prefix(y: int, m: int, d: int) -> str:
 #  -------------------- Ops --------------------
 @op(out=Out(Tuple[int,int,int], description="(year, month, day)"))
 def resolve_target_day(context: OpExecutionContext) -> Tuple[int,int,int]:
-    """Día de consolidación -> hoy (Europe/Madrid). No necesita run_config."""
+    """Día de consolidación -> ayer (Europe/Madrid). No necesita run_config."""
+    offset = CONSOLIDATE_DAY_OFFSET
     now_local = datetime.now(timezone.utc).astimezone(TZ_EUROPE_MAD)
-    yesterday_local = now_local - timedelta(days=1)
-    y, m, d = yesterday_local.year, yesterday_local.month, yesterday_local.day
-    get_dagster_logger().info(f"Consolidando para el día: {y:04d}-{m:02d}-{d:02d}")
+    target_local = now_local + timedelta(days=offset)
+    y, m, d = target_local.year, target_local.month, target_local.day
+    get_dagster_logger().info(f"Consolidando para el día: {y:04d}-{m:02d}-{d:02d} (offset={offset})")
     return (y, m, d)
 
 @op(ins={"ymd": In(Tuple[int,int,int])},
-    out=Out(List[str], description="Keys de los datos.csv a consolidar"))
+    out=Out(List[str], description="Keys de los data.csv a consolidar"))
 def list_day_csvs(context: OpExecutionContext, ymd: Tuple[int,int,int]) -> List[str]:
     y, m, d = ymd
     prefix = bronze_day_prefix(y, m, d)
     keys: List[str] = []
     for obj in _list_objects(prefix):
         key = obj["Key"]
-        if key.lower().endswith("/datos.csv"):
+        if key.lower().endswith("/data.csv"):
             keys.append(key)
     if not keys:
-        raise Failure(f"No se encontraron datos.csv en s3://{BUCKET}/{prefix}")
+        raise Failure(f"No se encontraron data.csv en s3://{BUCKET}/{prefix}")
     get_dagster_logger().info(f"Encontrados {len(keys)} CSV para {y:04d}-{m:02d}-{d:02d}")
     return keys
 
@@ -127,7 +129,7 @@ def download_and_concat(csv_keys: List[str]) -> pd.DataFrame:
     out=Out(str, description="S3 key del CSV consolidado"))
 def upload_consolidated_csv(df: pd.DataFrame, ymd: Tuple[int,int,int]) -> str:
     y, m, d = ymd
-    out_key = f"{bronze_day_prefix(y, m, d)}_consolidated/datos_consolidated.csv"
+    out_key = f"{bronze_day_prefix(y, m, d)}_consolidated/data_consolidated.csv"  # <-- data_consolidated.csv
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     s3 = make_s3()
     s3.put_object(
@@ -144,7 +146,7 @@ def upload_consolidated_csv(df: pd.DataFrame, ymd: Tuple[int,int,int]) -> str:
 def upload_consolidated_parquet(df: pd.DataFrame, ymd: Tuple[int,int,int]) -> str:
     y, m, d = ymd
     # Ruta en Silver particionada por día
-    out_key = f"{_silver_day_prefix(y, m, d)}datos_consolidated.parquet"
+    out_key = f"{_silver_day_prefix(y, m, d)}data_consolidated.parquet"  # <-- data_consolidated.parquet
 
     # Escritura Parquet
     import pyarrow as pa
@@ -178,14 +180,14 @@ def upload_consolidated_parquet(df: pd.DataFrame, ymd: Tuple[int,int,int]) -> st
 def register_consolidated_in_iceberg(context: OpExecutionContext, parquet_key: str, ymd: Tuple[int,int,int]) -> str:
     """
     Registra el Parquet consolidado en una tabla Iceberg particionada por (year, month, day).
-    Tabla destino: <ICEBERG_CATALOG>.<ICEBERG_DB>.datos_consolidated
+    Tabla destino: <ICEBERG_CATALOG>.<ICEBERG_DB>.data_consolidated
     """
     logger = get_dagster_logger()
     if not parquet_key:
         raise Failure("parquet_key vacío; nada que registrar en Iceberg")
 
     y, m, d = ymd
-    full_table = f"{ICEBERG_CATALOG}.{ICEBERG_DB}.datos_consolidated"
+    full_table = f"{ICEBERG_CATALOG}.{ICEBERG_DB}.data_consolidated"  # <-- nombre de tabla actualizado
     parquet_uri = f"s3a://{BUCKET}/{parquet_key}"
 
     spark = (
@@ -235,12 +237,7 @@ def register_consolidated_in_iceberg(context: OpExecutionContext, parquet_key: s
         )
 
         # Inserta los datos del día
-        inserted = spark.sql(f"INSERT INTO {full_table} SELECT * FROM to_append")
-        logger.info(f"INSERT completado en {full_table}. Rows: {inserted.rowcount if hasattr(inserted,'rowcount') else 'n/a'}")
-
-        # Opcional: recuento tras insertar
-        total = spark.table(full_table).count()
-        logger.info(f"Filas totales en {full_table}: {total}")
+        spark.sql(f"INSERT INTO {full_table} SELECT * FROM to_append")
 
         return full_table
     except Exception as e:
