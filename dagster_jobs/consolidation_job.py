@@ -114,10 +114,10 @@ def download_and_concat(csv_keys: List[str]) -> pd.DataFrame:
         obj = s3.get_object(Bucket=BUCKET, Key=k)
         df = pd.read_csv(obj["Body"], dtype=col_types)
         # Normalizar columnas esperadas
-        for col in ("record_id", "timestamp", "intrinsics", "thickness"):
+        for col in ("record_id", "timestamp", "intrinsics", "results"):
             if col not in df.columns:
                 df[col] = pd.NA
-        frames.append(df[["record_id", "timestamp", "intrinsics", "thickness"]])
+        frames.append(df[["record_id", "timestamp", "intrinsics", "results"]])
     if not frames:
         raise Failure("No se pudieron leer CSVs para consolidar.")
     out = pd.concat(frames, ignore_index=True)
