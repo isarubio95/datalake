@@ -1,16 +1,15 @@
-# 🌌 2025 Lakehouse Stack
+# 🌌 2025 Data Lakehouse Stack
 
-Plataforma local de **data lakehouse** lista para ingeniería de datos moderna. Este stack combina almacenamiento S3 compatible, catálogo Iceberg/Hive, ejecución de Spark, SQL interactivo con Trino, orquestación con Dagster y transformaciones con dbt; todo empaquetado en contenedores y pensado para emular un entorno productivo.
+Plataforma de **Data Lakehouse** lista para replicar en un entorno enterprise real: bucket Amazon S3 gestionado vía IAM, catálogo Iceberg respaldado en Hive/MariaDB, cómputo distribuido con Spark, SQL federado mediante Trino, orquestación Dagster y transformaciones dbt, todo aislado en Docker Compose.
 
-> 🧪 **Versión del stack:**  
-> • MinIO `latest`  
-> • MariaDB `10.11`  
-> • Hive Metastore `3.1.3`  
-> • Apache Spark Thrift `3.3.2` + Iceberg `1.4.3`  
-> • Trino `475`  
-> • Dagster `1.9.10`  
-> • dbt Core `1.9.2`  
-> • Docker Compose compatible `≥ 2.20`
+> 🧪 **Versionado del stack**
+> • MariaDB `10.11`
+> • Hive Metastore `3.1.3`
+> • Apache Spark Thrift `3.3.2` + Iceberg `1.4.3`
+> • Trino `475`
+> • Dagster `1.9.10`
+> • dbt Core `1.9.2`
+> • Docker Compose `≥ 2.20`
 
 ---
 
@@ -20,7 +19,6 @@ Plataforma local de **data lakehouse** lista para ingeniería de datos moderna. 
 - [🧱 Arquitectura](#-arquitectura)
 - [🌿 Variables de entorno](#-variables-de-entorno)
 - [🧰 Comandos útiles](#-comandos-útiles)
-- [☁️ MinIO & Lago](#-minio--lago)
 - [🔥 Spark · Hive · Iceberg](#-spark--hive--iceberg)
 - [🪬 Dagster & dbt](#-dagster--dbt)
 - [🛠 Troubleshooting](#-troubleshooting)
@@ -30,8 +28,9 @@ Plataforma local de **data lakehouse** lista para ingeniería de datos moderna. 
 
 ## ⚡ Requisitos
 
-- Docker Engine ≥ 24  
-- Docker Compose ≥ 2.20  
+- Docker Engine ≥ 24
+- Docker Compose ≥ 2.20
+- Usuario IAM con permisos sobre `<TU_BUCKET>`
 
 ---
 
@@ -39,22 +38,52 @@ Plataforma local de **data lakehouse** lista para ingeniería de datos moderna. 
 
 ```bash
 # Clonar el repositorio
-git clone https://github.com/tu_usuario/datalake.git
+git clone https://github.com/isarubio95/datalake.git
 cd datalake
 
-# Inicializar buckets, catálogos y servicios base
-docker compose up -d mariadb metastore minio minio-setup
+# Crear .env con las variables oficiales
+cat <<'ENV' > .env
+COMPOSE_PROJECT_NAME=datalake
+NETWORK_NAME=datalake
 
-# Levantar el resto de servicios (Spark, Trino, Dagster, dbt runner)
+DB_HOST=mariadb
+DB_PORT=3306
+DB_ROOT_PASSWORD=<TU_CONTRASEÑA>
+DB_NAME=metastore_db
+DB_USER=hive
+DB_PASSWORD=<TU_CONTRASEÑA>
+
+AWS_ACCESS_KEY_ID=<TU_USUARIO_IAM>
+AWS_SECRET_ACCESS_KEY=<TU_CONTRASEÑA>
+S3_BUCKET=<TU_BUCKET>
+AWS_REGION=<TU_REGION>
+S3_ENDPOINT=https://s3.amazonaws.com
+
+SPARK_VERSION=3.3.2
+ICEBERG_CATALOG=iceberg
+ICEBERG_DB=backfat
+TRINO_VERSION=475
+PYTHON_IMAGE=python:3.10-slim-bookworm
+
+DAGSTER_HOME=/dagster_home
+INGEST_PREFIX=uploads/
+BRONZE_PREFIX=data/
+SILVER_PREFIX=silver/
+ENV
+
+# Inicializar base de datos y metastore
+docker compose up -d mariadb metastore
+
+# Levantar el resto de servicios
 docker compose up -d
+
+# (OPCIONAL) Permitir grandes volúmenes de trabajo
+docker exec -it datalake-mariadb mysql -u root -p -e "USE metastore_db; ALTER TABLE job_ticks MODIFY COLUMN tick_body MEDIUMTEXT;"
 ```
 
-📍 **UIs principales:**  
-• Dagster Webserver: [http://localhost:3000](http://localhost:3000)  
-• MinIO Console: [http://localhost:9001](http://localhost:9001)  
-• Trino Web UI: [http://localhost:8081](http://localhost:8081)
-
-🔑 **Credenciales por defecto:** `minio / MinioPass_2025!` en MinIO, `hive / hivepass` en MariaDB (solo servicios internos). Cámbialas para producción.
+📍 **Interfaces principales**
+• Dagster Webserver: [http://<TU_IP>:3000](http://localhost:3000)
+• Trino Web UI: [http://<TU_IP>:8081](http://localhost:8081)
 
 ---
 
@@ -68,9 +97,10 @@ flowchart LR
     GEN[Generador de datos<br/>scripts locales]
   end
   subgraph Storage
-    MINIO[MinIO<br/>S3-compatible]
+    S3[(Amazon S3<br/>data-lake-panoimagen)]
     HIVE[(Hive Metastore)]
     MYSQL[(MariaDB 10.11)]
+    SQS[(AWS SQS<br/>uploads queue)]
   end
   subgraph Compute
     DAGSTER[Dagster Webserver & Daemon]
@@ -82,178 +112,132 @@ flowchart LR
   end
   USERS[Data Engineers]
 
-  GEN -->|S3 API| MINIO
-  MINIO -->|Metadatos Iceberg| HIVE
+  GEN -->|aws s3 cp| S3
+  S3 -->|Metadatos Iceberg| HIVE
   HIVE -->|Persistencia| MYSQL
-  DAGSTER -->|Sensores & ops boto3| MINIO
+  DAGSTER -->|Sensores & boto3| S3
+  DAGSTER -->|Run triggers| SQS
   DAGSTER -->|Catálogo Dagster| MYSQL
-  DAGSTER -->|Registro Iceberg| SPARK
-  SPARK -->|Lectura/Escritura s3a| MINIO
-  SPARK -->|Catálogo Hive| HIVE
+  DAGSTER -->|Spark Submit| SPARK
+  SPARK -->|s3a://| S3
+  SPARK -->|Catalogo Hive| HIVE
   DBTRUN -->|Perfil spark| SPARK
   DBTRUN -->|Perfil trino| TRINO
   TRINO -->|Catalog = iceberg| HIVE
-  TRINO -->|Lee objetos Iceberg| MINIO
+  TRINO -->|Lee Iceberg (s3a)| S3
   USERS -->|UI 3000| DAGSTER
   USERS -->|SQL/API 8081| TRINO
 ```
 
-- **MinIO** centraliza el almacenamiento bruto, landing y capas refinadas.  
-- **Hive Metastore** ejecutándose sobre MariaDB almacena el catálogo Iceberg y lo comparte con Spark y Trino.  
-- **Dagster** vigila el bucket `ingest/` mediante sensores S3, orquesta el pipeline y registra tablas en el catálogo a través de Spark.  
-- **Spark Thrift** expone JDBC y UI, escribe/lee en MinIO con driver `s3a` y aplica los paquetes de Iceberg.  
-- **dbt Runner** dispone de perfiles preconfigurados para apuntar tanto a Spark como a Trino, reutilizando los mismos catálogos.  
-- **Trino** consulta Iceberg en MinIO gracias al Hive Metastore y expone UI/API para analytics ad-hoc.
+- **Amazon S3** aloja zonas `uploads/`, `data/` (bronze) y `silver/`; se accede con firma SigV4 y TLS.
+- **Hive Metastore** guarda metadatos Iceberg en MariaDB y expone `thrift://metastore:9083` para Spark y Trino.
+- **Dagster** usa sensores sobre `uploads/` y (opcionalmente) el `SQS_QUEUE_URL` para detectar lotes, dispara `ingest_job` y `consolidation_job`, y guarda runs en MariaDB.
+- **Spark Thrift Server** ejecuta lectura/escritura `s3a://` con los paquetes Iceberg y AWS, además de exponer JDBC.
+- **dbt Runner** comparte perfiles para Spark y Trino, reutilizando un único conjunto de modelos.
+- **Trino** monta el catálogo `iceberg` y consulta las mismas tablas Iceberg sin copias adicionales.
 
 ### Flujo de datos end-to-end
 
 ```mermaid
 sequenceDiagram
   participant U as Usuario
-  participant S3 as Bucket ingest/
+  participant Upload as S3 uploads/
   participant Sen as Sensor Dagster
-  participant Job as Job ingest_silver
+  participant Job as ingest_job
   participant Sp as Spark/Iceberg
   participant Cat as Hive Catalog
   participant SQL as Trino/dbt
-
-  U->>S3: Subir Excel/CSV vía scripts o consola
-  Sen-->>S3: Escaneo incremental (S3 ListObjects)
-  Sen->>Job: RunRequest con metadata (key, timestamp)
-  Job->>S3: Descarga objeto y valida formato
-  Job->>Sp: Convierte a Parquet particionado y sube a silver/
-  Sp->>Cat: Registra/crea tabla Iceberg en MariaDB
-  Job->>Job: Ejecuta `dbt build`
-  SQL-->>Cat: Resuelve esquema Iceberg actualizado
-  SQL-->>S3: Ejecuta consultas interactuando con los Parquet
+  U->>Upload: aws s3 sync ./batch uploads/
+  Sen->>Upload: list_objects_v2()
+  Sen->>Job: RunRequest (prefix, timestamp)
+  Job->>Sp: move_source_folder_to_processed()
+  Sp->>Cat: Registrar particiones Iceberg
+  SQL->>Cat: Consultas interactivas (Trino/dbt)
 ```
 
-Este recorrido cubre de **landing** (Excel/CSV) a **capa Silver** optimizada y consultable. El job secundario `organize_parquet` reorganiza y compacta los ficheros generados por otras ingestas manteniendo particiones por hora.
+1. Los productores envían carpetas completas a `s3://data-lake-panoimagen/uploads/` con sus `intrinsics.json`.
+2. El sensor de Dagster detecta nuevos prefijos, mueve los objetos a `data/YYYY/MM/DD/` y etiqueta el lote.
+3. `consolidation_job` genera CSV/Parquet consolidados en `silver/` y registra tablas Iceberg en el catálogo `iceberg.backfat`.
+4. Trino y dbt consultan o transforman sobre el mismo conjunto de tablas Iceberg.
 
 ---
 
 ## 🌿 Variables de entorno
 
-Los valores viven en `.env`. Ajusta credenciales y prefijos antes de exponer el stack.
+Consumo desde `.env` y `docker-compose.yml`.
 
-```env
-COMPOSE_PROJECT_NAME=ngods
-NETWORK_NAME=ngodsnet
+| Variable | Valor ejemplo | Descripción |
+|----------|---------------|-------------|
+| `COMPOSE_PROJECT_NAME` | `datalake` | Prefijo para nombres de contenedores. |
+| `NETWORK_NAME` | `datalake` | Red bridge compartida por los servicios. |
+| `DB_HOST` / `DB_PORT` | `mariadb` / `3306` | Endpoint del MariaDB que respalda Hive y Dagster. |
+| `DB_ROOT_PASSWORD` | `admin123` | Contraseña root para inicializar la base. |
+| `DB_NAME` | `metastore_db` | Base donde Hive persiste los metadatos. |
+| `DB_USER` / `DB_PASSWORD` | `hive` / `hivepass` | Usuario de aplicación para Hive y Dagster. |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `AKIA…` / `+tsu…` | Credenciales IAM con permisos S3+SQS. |
+| `S3_BUCKET` | `data-lake-panoimagen` | Bucket único del lake. |
+| `AWS_REGION` | `eu-west-1` | Región usada por boto3 y drivers Hadoop. |
+| `S3_ENDPOINT` | `https://s3.amazonaws.com` | Endpoint global para firmas SigV4. |
+| `SQS_QUEUE_URL` | `https://sqs.eu-west-1.amazonaws.com/...` | Cola que puede usarse para eventos de ingesta. |
+| `SPARK_VERSION` | `3.3.2` | Referencia del runtime Spark. |
+| `ICEBERG_CATALOG` / `ICEBERG_DB` | `iceberg` / `backfat` | Espacio lógico de tablas Iceberg. |
+| `TRINO_VERSION` | `475` | Imagen oficial usada por Trino. |
+| `PYTHON_IMAGE` | `python:3.10-slim-bookworm` | Base para el contenedor dbt. |
+| `DAGSTER_HOME` | `/dagster_home` | Ruta persistente para run storage Dagster. |
+| `INGEST_PREFIX` | `uploads/` | Prefijo monitorizado por el sensor. |
+| `BRONZE_PREFIX` | `data/` | Prefijo destino de bronce. |
+| `SILVER_PREFIX` | `silver/` | Prefijo de escritura refinada. |
 
-DB_HOST=mariadb
-DB_PORT=3306
-DB_ROOT_PASSWORD=admin123
-DB_NAME=metastore_db
-DB_USER=hive
-DB_PASSWORD=hivepass
-
-MINIO_ROOT_USER={user}
-MINIO_ROOT_PASSWORD={password}
-S3_BUCKET=ngods
-S3_ENDPOINT=http://minio:9000
-AWS_REGION=us-east-1
-
-SPARK_VERSION=3.3.2
-TRINO_VERSION=475
-PYTHON_IMAGE=python:3.10-slim-bookworm
-
-INGEST_PREFIX=ingest/
-BRONZE_PREFIX=bronze/
-SILVER_PREFIX=silver/
-```
-
-🔐 **Recomendaciones para producción:**
-
-1. Genera usuarios/contraseñas únicos para MinIO y MariaDB.  
-2. Cambia los nombres de bucket y prefijos (`S3_BUCKET`, `INGEST_PREFIX`, `SILVER_PREFIX`).  
-3. Restringe la red Docker a máquinas de confianza y aplica TLS/SSL en el endpoint S3 si sale a Internet.  
-4. Ajusta el catálogo `dbt` (schema/catalog) según tus políticas de naming.
+Añade `AWS_SESSION_TOKEN`, `HTTP(S)_PROXY` o `AWS_CA_BUNDLE` si operas detrás de STS, proxy corporativo o TLS custom.
 
 ---
 
 ## 🧰 Comandos útiles
 
 ```bash
-# Ver el estado de los contenedores
+# Iniciar contenedor en segundo plano
+docker compose up -d
+
+# Detener stack y limpiar volúmenes
+docker compose down -v
+
+# Estado de servicios
 docker compose ps
 
-# Seguir logs en tiempo real (ej. Dagster daemon)
+# Logs del daemon de Dagster
 docker compose logs -f dagster-daemon
 
-# Ejecutar un job de Dagster manualmente
-docker compose exec dagster-webserver dagster job launch -m dagster_jobs -j ingest_silver_job
-
-# Lanzar transformaciones dbt (perfil trino por defecto)
+# Ejecutar dbt (perfil trino por defecto)
 docker compose exec dbt-runner dbt build --profiles-dir /root/.dbt
-
-# Abrir un shell de Spark SQL vía beeline
-docker compose exec spark-thrift beeline -u 'jdbc:hive2://spark-thrift:10000/;transportMode=binary'
-
-# Detener y limpiar todo (incluyendo volúmenes)
-docker compose down -v
-```
-
-📦 **Generador de datos de ejemplo:**
-
-```bash
-python -m venv generador-datos/.venv
-source generador-datos/.venv/bin/activate  # Windows: .venv\\Scripts\\activate
-pip install -r generador-datos/requirements.txt
-
-export MINIO_ENDPOINT="http://localhost:9000"
-export MINIO_ACCESS_KEY="tu_password"
-export MINIO_SECRET_KEY="tu_password"
-export S3_BUCKET="ngods"
-export S3_PREFIX="ingest"
-
-python generador-datos/generate_and_upload_excel.py --num-files 100 --rows 50
-```
-
----
-
-## ☁️ MinIO & Lago
-
-- **Puertos:** API `9000`, consola web `9001`.  
-- **Bucket inicial:** `ngods` con carpetas `ingest/`, `bronze/`, `silver/` creadas automáticamente por `minio-setup`.  
-- **Conexión S3:** todas las aplicaciones usan `http://minio:9000` y acceso estilo path (`fs.s3a.path.style.access=true`).  
-- **Gestión visual:** desde la consola puedes arrastrar Excel/CSV o inspeccionar los Parquet generados por los jobs.
-
-Para conectar una herramienta externa (ej. `mc`, `aws-cli`):
-
-```bash
-mc alias set ngods http://localhost:9000 minio MinioPass_2025!
-mc ls ngods/ngods/ingest
 ```
 
 ---
 
 ## 🔥 Spark · Hive · Iceberg
 
-- **Spark Thrift Server** escucha en `10000` (JDBC) y su UI en `4040`. Se lanza con `iceberg-spark-runtime` y drivers AWS para operar sobre MinIO.  
-- **Hive Metastore** expone `thrift://metastore:9083` y usa MariaDB como backend relacional.  
-- **Iceberg** se registra vía Spark dentro de los pipelines Dagster (`register_metadata_in_spark`) creando bases como `iceberg.silver`.  
-- **Compaction job** (`organize_parquet`) reorganiza Parquet en particiones `/year=YYYY/month=MM/day=DD/hour=HH/` y ejecuta `coalesce` para reducir archivos pequeños.
+- **Spark Thrift Server** escucha en `10000` (JDBC) y UI `4040`; carga `iceberg-spark-runtime`, `hadoop-aws` y `aws-java-sdk` para hablar con S3.
+- **Hive Metastore** expone `thrift://metastore:9083` y persiste en MariaDB `metastore_db` (`hive/hivepass`).
+- **Iceberg** escribe tablas dentro del catálogo `iceberg` y la base `<TU_DB>`, con particiones por `year/month/day` alimentadas desde Dagster.
+- **Compaction**: el job `consolidation_job` crea CSV y Parquet consolidados antes de insertar en Iceberg, reduciendo archivos pequeños.
 
-Conéctate desde herramientas externas (ej. DBeaver) usando JDBC Hive2 al puerto `10000` si necesitas inspeccionar esquemas Spark.
+Puedes depurar con JDBC Hive2 (`spark-thrift:10000`), `spark-sql` dentro del contenedor o usar Trino para verificar consistencia de metadatos.
 
 ---
 
 ## 🪬 Dagster & dbt
 
-- **Dagster Webserver** (`http://localhost:3000`) muestra sensores, jobs (`ingest_silver_job`, `organize_parquet`) y schedules.  
-- **Dagster Daemon** ejecuta el sensor `s3_new_objects_sensor_silver` que monitoriza nuevos objetos en `ingest/`.  
-- **Persistencia Dagster:** se apoya en `dagster-mysql` apuntando a la misma MariaDB (`metastore_db`) para mantener historiales de runs y sensores.  
-- **dbt Runner** (contenedor con `sleep infinity`) comparte el código del repositorio vía volumen, usando perfiles:
-  - `trino`: catálogo `iceberg`, schema por defecto `default`.
-  - `spark`: acceso thrift, ideal para pruebas rápidas de desarrollo.
+- **Dagster Webserver** (`http://localhost:3000`) expone `ingest_job`, `consolidation_job`, el sensor `s3_process_existing_files_sensor` y el schedule `daily_consolidation_schedule`.
+- **Dagster Daemon** recicla credenciales IAM para listar S3/SQS, mueve lotes a bronce y dispara consolidaciones.
+- **Persistencia Dagster** vive en MariaDB mediante `dagster-mysql`, lo que habilita backfills y reintentos.
+- **dbt Runner** (contenedor `sleep infinity`) comparte el repo por volumen y define perfiles `trino` (catálogo Iceberg) y `spark` (Thrift) dentro de `dbt/profiles.yml`.
 
-Ejecuta dbt directamente desde el contenedor:
+Ejecuta dbt dentro del contenedor:
 
 ```bash
 docker compose exec dbt-runner dbt debug
 ```
 
-El comando `dbt build` al final del job Dagster asegura que modelos, tests y snapshots se mantengan sincronizados tras cada ingesta.
+`dbt build` se encadena tras cada ingesta para aplicar tests y snapshots, garantizando que Trino y Spark lean el mismo linaje Iceberg.
 
 ---
 
@@ -261,19 +245,14 @@ El comando `dbt build` al final del job Dagster asegura que modelos, tests y sna
 
 | Síntoma | Posibles causas | Cómo verificar |
 |--------|-----------------|----------------|
-| Dagster sensor no detecta archivos | Variables `S3_BUCKET`/`S3_PREFIX` incorrectas o credenciales MinIO inválidas | `docker compose logs dagster-daemon` y `mc ls` sobre la ruta esperada |
-| Trino muestra tablas vacías | Job de ingesta no registró Iceberg o dbt falló | Revisar runs en Dagster y logs de `register_metadata_in_spark` |
-| Spark Thrift no arranca | Red `ngodsnet` ausente o metastore inaccesible | `docker network ls` y `docker compose logs spark-thrift` |
-| Consola MinIO inaccesible | Puertos ocupados o contenedor caído | `docker compose ps minio` y asegurarse que `9001` está libre |
-| Errores de certificados S3 | Se usa HTTPS sin TLS configurado | Ajusta `S3_ENDPOINT` y activa certificados válidos o usa HTTP local |
+| Sensor Dagster no detecta archivos | `S3_BUCKET`/`INGEST_PREFIX` incorrectos, permisos IAM insuficientes o clock skew | `docker compose logs dagster-daemon` + `aws s3 ls s3://data-lake-panoimagen/uploads/` |
+| Trino lista tablas vacías | Falló la inserción en Iceberg o el catálogo apunta a otro DB | Revisar runs Dagster y `docker compose logs spark-thrift trino` |
+| Spark Thrift no arranca | Metastore inaccesible o credenciales S3 ausentes | `docker compose logs spark-thrift` + probar `nc -z localhost 9083` |
+| Dagster pierde historial | `DAGSTER_HOME` sin volumen persistente o credenciales DB erróneas | Validar volumen `./dagster_home` y `docker compose logs dagster-webserver` |
+| Errores TLS S3 | Endpoint bloqueado por proxy o certificados corporativos | Configura `AWS_CA_BUNDLE` y `HTTPS_PROXY` en los servicios afectados |
 
 ---
 
 ## 📝 Changelog
 
-- **2025-02-10:** Primera versión unificada del README con arquitectura completa NGODS 2025.
-
----
-
-
-> 💡 ¿Ideas, mejoras o nuevas integraciones? ¡Abre un issue o PR y llevemos este lakehouse aún más lejos!
+- **2025-11-12:** Actualización completa de la guía para reflejar AWS S3, SQS y los nuevos valores de entorno.
