@@ -94,43 +94,43 @@ docker exec -it datalake-mariadb mysql -u root -p -e "USE metastore_db; ALTER TA
 ```mermaid
 flowchart LR
   subgraph Producers
-    GEN[Generador de datos / scripts locales]
+    GEN["Generador de datos / scripts locales"]
   end
 
   subgraph Storage
-    S3[(Amazon S3\ndata-lake-panoimagen)]
-    HIVE[(Hive Metastore)]
-    MYSQL[(MariaDB 10.11)]
-    SQS[(AWS SQS\nuploads queue)]
+    S3["Amazon S3 (data-lake-panoimagen)"]
+    HIVE["Hive Metastore"]
+    MYSQL["MariaDB 10.11"]
+    SQS["AWS SQS (uploads queue)"]
   end
 
   subgraph Compute
-    DAGSTER[Dagster Webserver & Daemon]
-    SPARK[Spark Thrift Server]
-    DBTRUN[dbt Runner]
+    DAGSTER["Dagster Webserver & Daemon"]
+    SPARK["Spark Thrift Server"]
+    DBTRUN["dbt Runner"]
   end
 
   subgraph SQL
-    TRINO[Trino 475]
+    TRINO["Trino 475"]
   end
 
-  USERS[Data Engineers]
+  USERS["Data Engineers"]
 
-  GEN -->|aws s3 cp| S3
-  S3 -->|Metadatos Iceberg| HIVE
-  HIVE -->|Persistencia| MYSQL
-  DAGSTER -->|Sensores & boto3| S3
-  DAGSTER -->|Run triggers| SQS
-  DAGSTER -->|Catálogo Dagster| MYSQL
-  DAGSTER -->|Spark Submit| SPARK
-  SPARK -->|s3a://| S3
-  SPARK -->|Catálogo Hive| HIVE
-  DBTRUN -->|Perfil Spark| SPARK
-  DBTRUN -->|Perfil Trino| TRINO
-  TRINO -->|Catálogo Iceberg| HIVE
-  TRINO -->|Lee Iceberg (s3a)| S3
-  USERS -->|UI 3000| DAGSTER
-  USERS -->|SQL/API 8081| TRINO
+  GEN -->|"aws s3 cp"| S3
+  S3 -->|"Metadatos Iceberg"| HIVE
+  HIVE -->|"Persistencia"| MYSQL
+  DAGSTER -->|"Sensores + boto3"| S3
+  DAGSTER -->|"Run triggers"| SQS
+  DAGSTER -->|"Catálogo Dagster"| MYSQL
+  DAGSTER -->|"Spark jobs"| SPARK
+  SPARK -->|"s3a://"| S3
+  SPARK -->|"Catálogo Hive"| HIVE
+  DBTRUN -->|"Perfil Spark"| SPARK
+  DBTRUN -->|"Perfil Trino"| TRINO
+  TRINO -->|"Catálogo Iceberg"| HIVE
+  TRINO --> S3
+  USERS -->|"UI :3000"| DAGSTER
+  USERS -->|"SQL/API :8081"| TRINO
 
 ```
 
